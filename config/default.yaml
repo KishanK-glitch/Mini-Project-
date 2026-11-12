@@ -1,0 +1,87 @@
+# Default configuration. Override any value with an env var using the
+# VR__<SECTION>__<KEY> pattern, e.g.  VR__EMBEDDING__DEVICE=cuda
+# Relative paths are resolved against the project root.
+
+app:
+  name: video-retrieval
+  data_dir: data
+  log_level: INFO
+
+ingestion:
+  frame_stride: 5               # process every Nth frame (30 fps video -> ~6 fps)
+  max_side: 960                 # downscale frames so the longest side <= this (0 = off)
+  # --- motion skipping: don't run YOLO on frames where nothing changed ---
+  motion_skip: true
+  motion_min_area: 0.002        # fraction of pixels that must change to count as motion
+  force_detect_every_sec: 2.0   # still detect at least this often (static people/cars)
+  # --- one embedding per track (average of the sharpest crops) ---
+  crops_per_track: 5            # best-quality crops averaged into one vector
+  track_timeout_sec: 3.0        # track is finished when unseen for this long
+  max_track_sec: 30.0           # split very long tracks so clips stay short
+  frame_embed_every_n_sec: 5.0  # scene-level embedding (gives context like "near the gate")
+  min_crop_size: 24             # skip crops smaller than this (px)
+  crop_padding: 0.05            # padding around the box, fraction of box size
+  batch_size: 32
+  save_thumbnails: true
+  stream_reconnect_attempts: 5  # for RTSP / network streams
+
+detection:
+  backend: yolo
+  model: yolo11s.pt             # auto-downloaded by ultralytics on first run
+  runtime: auto                 # auto | openvino | torch  (auto = OpenVINO if installed)
+  confidence: 0.35
+  iou: 0.5
+  imgsz: 640
+  device: xpu                 # auto | cpu | cuda | intel:gpu | intel:npu | intel:cpu
+  classes: [person, bicycle, car, motorcycle, bus, truck, backpack, handbag, suitcase]
+
+tracking:
+  backend: bytetrack            # bytetrack | iou (simple fallback)
+  activation_threshold: 0.35
+  lost_track_buffer: 30         # frames (at the *processed* frame rate)
+  matching_threshold: 0.8
+  min_consecutive_frames: 1
+
+embedding:
+  backend: siglip               # siglip | clip | dummy (dummy = colour-only, for tests)
+  model: google/siglip-base-patch16-224
+  # clip model, if backend=clip: openai/clip-vit-base-patch32
+  device: auto                  # auto | cpu | cuda | xpu (Intel Arc) | mps
+  batch_size: 32
+  query_template: "this is a photo of {}."
+
+database:
+  # SQLite by default; use PostgreSQL via docker-compose (see .env.example)
+  metadata_url: sqlite:///data/metadata.db
+  vector_backend: faiss         # faiss | numpy (auto-fallback if faiss missing)
+  vector_dir: data/vectors
+
+retrieval:
+  top_k: 10
+  candidate_pool: 300           # nearest neighbours fetched before filtering/grouping
+  # raw similarity floor per backend (SigLIP scores are lower than CLIP's - tune on your footage)
+  min_score:
+    clip: 0.20
+    siglip: 0.04
+    dummy: 0.15
+  relative_margin: 0.08         # drop results scoring below best*(1-margin) (0 = off)
+  class_boost: 0.01             # bonus when a class word in the query matches the object
+  segment_gap_sec: 5.0          # hits of one track closer than this merge into one segment
+  clip_padding_sec: 2.0
+  # --- rejection of non-matches ---
+  calibrate: true               # re-score each hit against contrast prompts
+  min_confidence: 0.30          # drop hit if P(query) among the contrast prompts is below this
+  logit_scale: 100.0            # used only when the encoder doesn't expose its own scale
+  negative_prompts:             # generic contrast prompts (+ colour-swapped copies of the query)
+    - a person
+    - a car
+    - a street
+    - an empty scene
+    - a blurry photo
+  # strict: a colour word in the query must match the colour measured from the pixels (HSV)
+  color_mode: strict            # strict | off
+
+api:
+  host: 0.0.0.0
+  port: 8000
+  cors_origins: ["*"]

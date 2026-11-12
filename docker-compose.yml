@@ -1,0 +1,48 @@
+# PostgreSQL for the metadata store (the app itself runs locally by default).
+#
+#   docker compose up -d postgres
+#   then set in .env:
+#   DATABASE_URL=postgresql+psycopg2://vr_user:vr_password@localhost:5432/video_retrieval
+#
+# Optional: run the API in a container too (CPU only):
+#   docker compose --profile full up
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: vr-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vr_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vr_password}
+      POSTGRES_DB: ${POSTGRES_DB:-video_retrieval}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vr_user} -d ${POSTGRES_DB:-video_retrieval}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    profiles: ["full"]
+    image: python:3.11-slim
+    container_name: vr-api
+    working_dir: /app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-vr_user}:${POSTGRES_PASSWORD:-vr_password}@postgres:5432/${POSTGRES_DB:-video_retrieval}
+    volumes:
+      - .:/app
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 ffmpeg &&
+             pip install --no-cache-dir -r requirements.txt &&
+             python main.py serve"
+
+volumes:
+  pgdata:
