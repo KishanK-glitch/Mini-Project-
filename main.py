@@ -99,26 +99,295 @@ class Job:
         )
 
 
-INDEX_HTML = """<!doctype html><meta charset=utf-8><title>Video Retrieval</title>
-<style>body{font:16px system-ui;max-width:980px;margin:2rem auto;padding:0 1rem}
-form{display:flex;gap:.5rem}input{flex:1;padding:.6rem}button{padding:.6rem 1rem}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:1rem;margin-top:1rem}
-.card{border:1px solid #ddd;border-radius:8px;padding:.5rem;font-size:14px}
-.card img{width:100%;border-radius:4px}small{color:#666}</style>
-<h2>Natural-language video search</h2>
-<form id=f><input id=q placeholder='e.g. a person wearing a red shirt near the main gate'>
-<button>Search</button></form><p id=meta></p><div class=grid id=out></div>
-<script>
-f.onsubmit=async e=>{e.preventDefault();meta.textContent='Searching...';out.innerHTML='';
-const r=await fetch('/search',{method:'POST',headers:{'Content-Type':'application/json'},
-body:JSON.stringify({query:q.value,top_k:12})});const d=await r.json();
-if(!r.ok){meta.textContent=d.detail||'Error';return}
-meta.textContent=d.count?d.count+' results in '+d.took_ms+' ms':'No matching footage found.';
-out.innerHTML=d.results.map(h=>`<div class=card>${h.thumbnail_url?`<img src="${h.thumbnail_url}">`:''}
-<b>#${h.rank} ${h.class_name}</b> <small>score ${h.score}${h.confidence!=null?' · conf '+h.confidence:''}</small><br>${h.video_name}${h.upper_color?'<br><small>'+h.upper_color+(h.lower_color?' / '+h.lower_color:'')+'</small>':''}<br>
-<small>${h.timecode} (${h.start_sec}s-${h.end_sec}s)${h.start_time?'<br>'+h.start_time:''}</small><br>
-${h.clip_url?`<a href="${h.clip_url}" target=_blank>Play clip</a>`:''}</div>`).join('')};
-</script>"""
+
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CCTV Video Search</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
+            color: #222;
+            max-width: 950px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+
+        h1 {
+            font-size: 26px;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+        }
+
+        .search-box {
+            background: white;
+            padding: 22px;
+            border-radius: 10px;
+            border: 1px solid #ddd;
+        }
+
+        label {
+            display: block;
+            font-weight: bold;
+            margin-bottom: 8px;
+        }
+
+        select, input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+            font-size: 15px;
+            margin-bottom: 18px;
+        }
+
+        button {
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 15px;
+        }
+
+        button:hover {
+            background: #1d4ed8;
+        }
+
+        button:disabled {
+            background: #999;
+            cursor: not-allowed;
+        }
+
+        #status {
+            margin: 20px 0;
+            color: #555;
+        }
+
+        .result {
+            background: white;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 14px;
+            margin-bottom: 15px;
+            display: flex;
+            gap: 18px;
+            align-items: center;
+        }
+
+        .result img {
+            width: 180px;
+            height: 115px;
+            object-fit: cover;
+            border-radius: 6px;
+        }
+
+        .details {
+            line-height: 1.7;
+        }
+
+        .details small {
+            color: #666;
+        }
+
+        a {
+            color: #2563eb;
+            text-decoration: none;
+        }
+
+        @media (max-width: 600px) {
+            .result {
+                flex-direction: column;
+                align-items: flex-start;
+            }
+
+            .result img {
+                width: 100%;
+                height: auto;
+            }
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>CCTV Video Search</h1>
+    <p class="subtitle">
+        Search surveillance footage using natural language.
+    </p>
+
+    <div class="search-box">
+
+        <label for="camera">Select CCTV Camera</label>
+        <select id="camera">
+            <option value="">All CCTV Cameras</option>
+        </select>
+
+        <label for="query">Describe what you are looking for</label>
+        <input
+            type="text"
+            id="query"
+            placeholder="e.g. A person wearing a red shirt"
+        >
+
+        <button id="searchBtn" onclick="searchVideos()">
+            Search
+        </button>
+
+    </div>
+
+    <p id="status"></p>
+    <div id="results"></div>
+
+    <script>
+        const cameraSelect = document.getElementById("camera");
+        const queryInput = document.getElementById("query");
+        const resultsDiv = document.getElementById("results");
+        const statusText = document.getElementById("status");
+        const searchBtn = document.getElementById("searchBtn");
+
+        // Load available cameras from the backend
+        async function loadCameras() {
+            try {
+                const response = await fetch("/videos");
+
+                if (!response.ok) {
+                    throw new Error("Could not load cameras");
+                }
+
+                const videos = await response.json();
+
+                const cameras = [...new Set(
+                    videos.map(video => video.camera_id).filter(Boolean)
+                )];
+
+                cameras.forEach(cameraId => {
+                    const option = document.createElement("option");
+                    option.value = cameraId;
+                    option.textContent = cameraId;
+                    cameraSelect.appendChild(option);
+                });
+
+            } catch (error) {
+                statusText.textContent = error.message;
+            }
+        }
+
+        // Search footage
+        async function searchVideos() {
+            const query = queryInput.value.trim();
+            const cameraId = cameraSelect.value;
+
+            if (!query) {
+                statusText.textContent = "Please enter a search description.";
+                return;
+            }
+
+            searchBtn.disabled = true;
+            statusText.textContent = "Searching footage...";
+            resultsDiv.innerHTML = "";
+
+            try {
+                const response = await fetch("/search", {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        query: query,
+                        top_k: 12,
+                        camera_id: cameraId || null
+                    })
+                });
+
+                const data = await response.json();
+
+                if (!response.ok) {
+                    throw new Error(data.detail || "Search failed");
+                }
+
+                statusText.textContent = data.count
+                    ? `${data.count} results found in ${data.took_ms} ms`
+                    : "No matching footage found.";
+
+                data.results.forEach(item => {
+                    const card = document.createElement("div");
+                    card.className = "result";
+
+                    if (item.thumbnail_url) {
+                        const image = document.createElement("img");
+                        image.src = item.thumbnail_url;
+                        image.alt = "Matching CCTV footage";
+                        card.appendChild(image);
+                    }
+
+                    const details = document.createElement("div");
+                    details.className = "details";
+
+                    const title = document.createElement("strong");
+                    title.textContent = `#${item.rank} ${item.class_name}`;
+
+                    const camera = document.createElement("div");
+                    camera.textContent = `Camera: ${item.camera_id || "Unknown"}`;
+
+                    const video = document.createElement("div");
+                    video.textContent = `Video: ${item.video_name}`;
+
+                    const time = document.createElement("div");
+                    time.textContent = `Time: ${item.timecode}`;
+
+                    const score = document.createElement("small");
+                    score.textContent = `Score: ${item.score}`;
+
+                    details.append(title, camera, video, time, score);
+
+                    if (item.clip_url) {
+                        const link = document.createElement("a");
+                        link.href = item.clip_url;
+                        link.target = "_blank";
+                        link.textContent = "Play clip";
+                        details.appendChild(document.createElement("br"));
+                        details.appendChild(link);
+                    }
+
+                    card.appendChild(details);
+                    resultsDiv.appendChild(card);
+                });
+
+            } catch (error) {
+                statusText.textContent = error.message;
+            } finally {
+                searchBtn.disabled = false;
+            }
+        }
+
+        loadCameras();
+
+        queryInput.addEventListener("keydown", event => {
+            if (event.key === "Enter") {
+                searchVideos();
+            }
+        });
+    </script>
+
+</body>
+</html>
+"""
+
 
 
 # --------------------------------------------------------------------------
