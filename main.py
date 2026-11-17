@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import sys
 import threading
 import uuid
@@ -85,7 +87,7 @@ class Services:
 class Job:
     job_id: str
     source: str
-    status: str = "queued"
+    status: str = "queued"  # queued | converting | running | done | failed | stopped
     video_id: Optional[int] = None
     frames_processed: int = 0
     observations: int = 0
@@ -99,7 +101,6 @@ class Job:
         )
 
 
-
 INDEX_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -109,9 +110,7 @@ INDEX_HTML = """
     <title>CCTV Video Search</title>
 
     <style>
-        * {
-            box-sizing: border-box;
-        }
+        * { box-sizing: border-box; }
 
         body {
             font-family: Arial, sans-serif;
@@ -122,28 +121,20 @@ INDEX_HTML = """
             padding: 20px;
         }
 
-        h1 {
-            font-size: 26px;
-            margin-bottom: 8px;
-        }
+        h1 { font-size: 26px; margin-bottom: 8px; }
+        h2 { font-size: 18px; margin: 0 0 14px 0; }
 
-        .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-        }
+        .subtitle { color: #666; margin-bottom: 30px; }
 
-        .search-box {
+        .card {
             background: white;
             padding: 22px;
             border-radius: 10px;
             border: 1px solid #ddd;
+            margin-bottom: 22px;
         }
 
-        label {
-            display: block;
-            font-weight: bold;
-            margin-bottom: 8px;
-        }
+        label { display: block; font-weight: bold; margin-bottom: 8px; }
 
         select, input {
             width: 100%;
@@ -152,7 +143,11 @@ INDEX_HTML = """
             border-radius: 6px;
             font-size: 15px;
             margin-bottom: 18px;
+            background: white;
         }
+
+        .row { display: flex; gap: 16px; }
+        .row > div { flex: 1; }
 
         button {
             background: #2563eb;
@@ -163,20 +158,19 @@ INDEX_HTML = """
             cursor: pointer;
             font-size: 15px;
         }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #999; cursor: not-allowed; }
 
-        button:hover {
-            background: #1d4ed8;
-        }
+        .hint { color: #777; font-size: 13px; margin: -10px 0 16px 0; }
 
-        button:disabled {
-            background: #999;
-            cursor: not-allowed;
-        }
+        .bar { height: 8px; background: #e5e7eb; border-radius: 4px; margin-top: 14px; overflow: hidden; display: none; }
+        .bar > div { height: 100%; width: 0; background: #2563eb; transition: width .2s; }
 
-        #status {
-            margin: 20px 0;
-            color: #555;
-        }
+        #upStatus { margin: 12px 0 0 0; color: #444; }
+        #upStatus.error { color: #b91c1c; }
+
+        #status { margin: 20px 0 6px 0; color: #555; }
+        #notes { margin: 0 0 16px 0; color: #92400e; background: #fef3c7; border-radius: 6px; padding: 8px 12px; display: none; font-size: 14px; }
 
         .result {
             background: white;
@@ -194,31 +188,48 @@ INDEX_HTML = """
             height: 115px;
             object-fit: cover;
             border-radius: 6px;
+            cursor: zoom-in;
         }
 
-        .details {
-            line-height: 1.7;
+        .details { line-height: 1.7; }
+        .details small { color: #666; }
+
+        .badge {
+            display: inline-block;
+            background: #1e293b;
+            color: #fff;
+            border-radius: 4px;
+            padding: 1px 8px;
+            font-size: 12px;
+            margin-left: 8px;
+            vertical-align: middle;
         }
 
-        .details small {
-            color: #666;
-        }
+        a { color: #2563eb; text-decoration: none; cursor: pointer; }
 
-        a {
-            color: #2563eb;
-            text-decoration: none;
+        /* Popup for enlarged image / clip player */
+        #modal {
+            display: none;
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .85);
+            z-index: 10;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        #modal.open { display: flex; }
+        #modalBody img, #modalBody video {
+            max-width: 90vw;
+            max-height: 85vh;
+            border-radius: 8px;
+            background: #000;
         }
 
         @media (max-width: 600px) {
-            .result {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-
-            .result img {
-                width: 100%;
-                height: auto;
-            }
+            .row { flex-direction: column; gap: 0; }
+            .result { flex-direction: column; align-items: flex-start; }
+            .result img { width: 100%; height: auto; }
         }
     </style>
 </head>
@@ -226,103 +237,234 @@ INDEX_HTML = """
 <body>
 
     <h1>CCTV Video Search</h1>
-    <p class="subtitle">
-        Search surveillance footage using natural language.
-    </p>
+    <p class="subtitle">Upload surveillance footage, then search it using natural language.</p>
 
-    <div class="search-box">
+    <!-- 1. Upload -->
+    <div class="card">
+        <h2>1. Upload footage</h2>
 
-        <label for="camera">Select CCTV Camera</label>
-        <select id="camera">
-            <option value="">All CCTV Cameras</option>
-        </select>
+        <label for="file">Video file</label>
+        <input type="file" id="file">
+        <p class="hint" id="fmtHint"></p>
+
+        <div class="row">
+            <div>
+                <label for="upCamera">Camera name</label>
+                <input type="text" id="upCamera" value="cam-01" list="cameraList">
+                <datalist id="cameraList"></datalist>
+            </div>
+            <div>
+                <label for="upStart">Recording start time (optional)</label>
+                <input type="datetime-local" id="upStart">
+            </div>
+        </div>
+
+        <button id="upBtn" onclick="startUpload()">Upload &amp; index</button>
+        <div class="bar" id="bar"><div id="barFill"></div></div>
+        <p id="upStatus"></p>
+    </div>
+
+    <!-- 2. Search -->
+    <div class="card">
+        <h2>2. Search</h2>
+
+        <div class="row">
+            <div>
+                <label for="camera">CCTV camera</label>
+                <select id="camera"><option value="">All CCTV cameras</option></select>
+            </div>
+            <div>
+                <label for="videoSel">Video</label>
+                <select id="videoSel"><option value="">All videos</option></select>
+            </div>
+        </div>
 
         <label for="query">Describe what you are looking for</label>
-        <input
-            type="text"
-            id="query"
-            placeholder="e.g. A person wearing a red shirt"
-        >
+        <input type="text" id="query" placeholder="e.g. A person wearing a red shirt">
 
-        <button id="searchBtn" onclick="searchVideos()">
-            Search
-        </button>
-
+        <button id="searchBtn" onclick="searchVideos()">Search</button>
     </div>
 
     <p id="status"></p>
+    <div id="notes"></div>
     <div id="results"></div>
 
-    <script>
-        const cameraSelect = document.getElementById("camera");
-        const queryInput = document.getElementById("query");
-        const resultsDiv = document.getElementById("results");
-        const statusText = document.getElementById("status");
-        const searchBtn = document.getElementById("searchBtn");
+    <div id="modal" onclick="closeModal()">
+        <div id="modalBody" onclick="event.stopPropagation()"></div>
+    </div>
 
-        // Load available cameras from the backend
-        async function loadCameras() {
+    <script>
+        const $ = id => document.getElementById(id);
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        let uploadInfo = { extensions: [], max_mb: 0 };
+
+        // ---------- popup: enlarged image or clip player ----------
+        function openModal(kind, url) {
+            $("modalBody").innerHTML = "";
+            const el = document.createElement(kind === "video" ? "video" : "img");
+            el.src = url;
+            if (kind === "video") { el.controls = true; el.autoplay = true; el.muted = true; }
+            el.onerror = () => {
+                $("modalBody").innerHTML = '<p style="color:#fff">Could not load this file.</p>';
+            };
+            $("modalBody").appendChild(el);
+            $("modal").classList.add("open");
+        }
+        function closeModal() { $("modal").classList.remove("open"); $("modalBody").innerHTML = ""; }
+        document.addEventListener("keydown", e => { if (e.key === "Escape") closeModal(); });
+
+        // ---------- cameras + videos ----------
+        async function loadFilters(selectVideoId) {
             try {
                 const response = await fetch("/videos");
-
-                if (!response.ok) {
-                    throw new Error("Could not load cameras");
-                }
-
+                if (!response.ok) throw new Error("Could not load cameras");
                 const videos = await response.json();
 
-                const cameras = [...new Set(
-                    videos.map(video => video.camera_id).filter(Boolean)
-                )];
+                const prevCam = $("camera").value;
+                const prevVid = $("videoSel").value;
+                $("camera").innerHTML = '<option value="">All CCTV cameras</option>';
+                $("videoSel").innerHTML = '<option value="">All videos</option>';
+                $("cameraList").innerHTML = "";
 
-                cameras.forEach(cameraId => {
-                    const option = document.createElement("option");
-                    option.value = cameraId;
-                    option.textContent = cameraId;
-                    cameraSelect.appendChild(option);
+                [...new Set(videos.map(v => v.camera_id).filter(Boolean))].forEach(c => {
+                    const o = document.createElement("option");
+                    o.value = c; o.textContent = c;
+                    $("camera").appendChild(o);
+                    const d = document.createElement("option");
+                    d.value = c;
+                    $("cameraList").appendChild(d);
+                });
+                videos.filter(v => v.status === "done" || v.status === "stopped").forEach(v => {
+                    const o = document.createElement("option");
+                    o.value = v.id;
+                    o.textContent = v.name + " (" + v.camera_id + ")";
+                    $("videoSel").appendChild(o);
                 });
 
+                $("camera").value = prevCam;
+                $("videoSel").value = prevVid;
+                if (selectVideoId) {
+                    const v = videos.find(x => x.id === selectVideoId);
+                    if (v) { $("camera").value = v.camera_id; $("videoSel").value = String(v.id); }
+                }
             } catch (error) {
-                statusText.textContent = error.message;
+                $("status").textContent = error.message;
             }
         }
 
-        // Search footage
-        async function searchVideos() {
-            const query = queryInput.value.trim();
-            const cameraId = cameraSelect.value;
+        async function loadUploadInfo() {
+            try {
+                const r = await fetch("/upload-info");
+                uploadInfo = await r.json();
+                $("file").accept = uploadInfo.extensions.join(",") + ",video/*";
+                $("fmtHint").textContent = "Most video formats work (" +
+                    uploadInfo.extensions.slice(0, 8).join(" ") + " ...). Max " +
+                    uploadInfo.max_mb + " MB. Other formats are converted automatically.";
+            } catch (e) { /* hint is optional */ }
+        }
 
-            if (!query) {
-                statusText.textContent = "Please enter a search description.";
-                return;
+        // ---------- upload ----------
+        function setUp(text, isError) {
+            $("upStatus").textContent = text;
+            $("upStatus").className = isError ? "error" : "";
+        }
+        function setBar(pct) {
+            $("bar").style.display = "block";
+            $("barFill").style.width = pct + "%";
+        }
+        function endUpload() { $("upBtn").disabled = false; }
+        function failUpload(msg) { setUp(msg, true); $("bar").style.display = "none"; endUpload(); }
+
+        function startUpload() {
+            const file = $("file").files[0];
+            if (!file) { setUp("Choose a video file first.", true); return; }
+            const dot = file.name.lastIndexOf(".");
+            const ext = dot >= 0 ? file.name.slice(dot).toLowerCase() : "";
+            if (uploadInfo.extensions.length && !uploadInfo.extensions.includes(ext)) {
+                setUp("Unsupported file type " + (ext || "(none)") + ".", true); return;
+            }
+            if (uploadInfo.max_mb && file.size > uploadInfo.max_mb * 1024 * 1024) {
+                setUp("File is larger than " + uploadInfo.max_mb + " MB.", true); return;
             }
 
-            searchBtn.disabled = true;
-            statusText.textContent = "Searching footage...";
-            resultsDiv.innerHTML = "";
+            const fd = new FormData();
+            fd.append("file", file);
+            fd.append("camera_id", $("upCamera").value.trim() || "cam-01");
+            if ($("upStart").value) fd.append("start_time", $("upStart").value);
+
+            const xhr = new XMLHttpRequest();
+            xhr.open("POST", "/upload");
+            xhr.upload.onprogress = e => {
+                if (e.lengthComputable) {
+                    const pct = Math.round(e.loaded / e.total * 100);
+                    setBar(pct);
+                    setUp("Uploading... " + pct + "%");
+                }
+            };
+            xhr.onerror = () => failUpload("Network error while uploading.");
+            xhr.onload = () => {
+                let body = {};
+                try { body = JSON.parse(xhr.responseText); } catch (e) { /* not json */ }
+                if (xhr.status === 202) pollJob(body.job_id);
+                else failUpload(body.detail || ("Upload failed (" + xhr.status + ")"));
+            };
+            $("upBtn").disabled = true;
+            setBar(0);
+            setUp("Uploading...");
+            xhr.send(fd);
+        }
+
+        async function pollJob(jobId) {
+            while (true) {
+                let job;
+                try { job = await (await fetch("/jobs/" + jobId)).json(); }
+                catch (e) { failUpload("Lost connection to the server."); return; }
+
+                if (job.status === "queued") setUp("Waiting in the queue...");
+                else if (job.status === "converting") setUp("Converting the video to a standard format...");
+                else if (job.status === "running") setUp("Indexing... " + job.frames_processed + " frames processed");
+                else if (job.status === "done" || job.status === "stopped") {
+                    setBar(100);
+                    setUp("Done. " + job.observations + " searchable items indexed. You can search it now.");
+                    await loadFilters(job.video_id);
+                    endUpload();
+                    return;
+                } else { failUpload(job.error || ("Indexing " + job.status)); return; }
+                await sleep(1500);
+            }
+        }
+
+        // ---------- search ----------
+        async function searchVideos() {
+            const query = $("query").value.trim();
+            if (!query) { $("status").textContent = "Please enter a search description."; return; }
+
+            $("searchBtn").disabled = true;
+            $("status").textContent = "Searching footage...";
+            $("notes").style.display = "none";
+            $("results").innerHTML = "";
 
             try {
                 const response = await fetch("/search", {
                     method: "POST",
-                    headers: {
-                        "Content-Type": "application/json"
-                    },
+                    headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({
                         query: query,
                         top_k: 12,
-                        camera_id: cameraId || null
+                        camera_id: $("camera").value || null,
+                        video_id: $("videoSel").value ? parseInt($("videoSel").value) : null
                     })
                 });
-
                 const data = await response.json();
+                if (!response.ok) throw new Error(data.detail || "Search failed");
 
-                if (!response.ok) {
-                    throw new Error(data.detail || "Search failed");
-                }
-
-                statusText.textContent = data.count
+                $("status").textContent = data.count
                     ? `${data.count} results found in ${data.took_ms} ms`
                     : "No matching footage found.";
+                if (data.notes && data.notes.length) {
+                    $("notes").textContent = data.notes.join(" ");
+                    $("notes").style.display = "block";
+                }
 
                 data.results.forEach(item => {
                     const card = document.createElement("div");
@@ -332,6 +474,8 @@ INDEX_HTML = """
                         const image = document.createElement("img");
                         image.src = item.thumbnail_url;
                         image.alt = "Matching CCTV footage";
+                        image.title = "Click to enlarge";
+                        image.onclick = () => openModal("image", item.thumbnail_url);
                         card.appendChild(image);
                     }
 
@@ -340,54 +484,63 @@ INDEX_HTML = """
 
                     const title = document.createElement("strong");
                     title.textContent = `#${item.rank} ${item.class_name}`;
+                    if (item.is_night) {
+                        const badge = document.createElement("span");
+                        badge.className = "badge";
+                        badge.textContent = "Night / IR";
+                        title.appendChild(badge);
+                    }
 
                     const camera = document.createElement("div");
                     camera.textContent = `Camera: ${item.camera_id || "Unknown"}`;
-
                     const video = document.createElement("div");
                     video.textContent = `Video: ${item.video_name}`;
-
                     const time = document.createElement("div");
                     time.textContent = `Time: ${item.timecode}`;
 
-                    const score = document.createElement("small");
-                    score.textContent = `Score: ${item.score}`;
+                    const look = document.createElement("div");
+                    if (item.is_night) {
+                        const tone = [item.upper_tone, item.lower_tone].filter(Boolean).join(" / ");
+                        look.textContent = "Colour not available" + (tone ? ` (brightness: ${tone})` : "");
+                    } else if (item.upper_color) {
+                        look.textContent = "Colour: " + [item.upper_color, item.lower_color].filter(Boolean).join(" / ");
+                    }
 
-                    details.append(title, camera, video, time, score);
+                    const score = document.createElement("small");
+                    score.textContent = `Score: ${item.score}` +
+                        (item.confidence != null ? ` · conf ${item.confidence}` : "");
+
+                    details.append(title, camera, video, time);
+                    if (look.textContent) details.appendChild(look);
+                    details.appendChild(score);
 
                     if (item.clip_url) {
                         const link = document.createElement("a");
                         link.href = item.clip_url;
-                        link.target = "_blank";
                         link.textContent = "Play clip";
+                        link.onclick = e => { e.preventDefault(); openModal("video", item.clip_url); };
                         details.appendChild(document.createElement("br"));
                         details.appendChild(link);
                     }
 
                     card.appendChild(details);
-                    resultsDiv.appendChild(card);
+                    $("results").appendChild(card);
                 });
-
             } catch (error) {
-                statusText.textContent = error.message;
+                $("status").textContent = error.message;
             } finally {
-                searchBtn.disabled = false;
+                $("searchBtn").disabled = false;
             }
         }
 
-        loadCameras();
-
-        queryInput.addEventListener("keydown", event => {
-            if (event.key === "Enter") {
-                searchVideos();
-            }
-        });
+        loadUploadInfo();
+        loadFilters();
+        $("query").addEventListener("keydown", e => { if (e.key === "Enter") searchVideos(); });
     </script>
 
 </body>
 </html>
 """
-
 
 
 # --------------------------------------------------------------------------
@@ -424,8 +577,11 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             def progress(video_id: int, frames: int, obs: int) -> None:
                 job.video_id, job.frames_processed, job.observations = video_id, frames, obs
 
+            def stage(name: str) -> None:  # queued -> converting -> running
+                job.status = name
+
             res = svc().ingestion().ingest(
-                req.source, req.camera_id, req.start_time, job.stop, progress
+                req.source, req.camera_id, req.start_time, job.stop, progress, stage_cb=stage
             )
             job.video_id, job.frames_processed, job.observations = (
                 res.video_id, res.frames_processed, res.observations,
@@ -454,17 +610,50 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
     def ingest(req: IngestRequest):
         return submit(req).to_status()
 
+    upload_cfg = cfg.api.upload
+    allowed_ext = {e.lower() for e in upload_cfg.allowed_extensions}
+    max_bytes = int(upload_cfg.max_mb) * 1024 * 1024
+
+    @app.get("/upload-info")
+    def upload_info():
+        return {"extensions": sorted(allowed_ext), "max_mb": int(upload_cfg.max_mb)}
+
     @app.post("/upload", response_model=JobStatus, status_code=202)
     def upload(
         file: UploadFile = File(...),
         camera_id: str = Form("cam-01"),
         start_time: Optional[datetime] = Form(None),
     ):
-        dest = Path(cfg.paths.uploads) / f"{uuid.uuid4().hex[:8]}_{Path(file.filename or 'video').name}"
-        with open(dest, "wb") as out:
-            while chunk := file.file.read(1024 * 1024):
-                out.write(chunk)
-        return submit(IngestRequest(source=str(dest), camera_id=camera_id, start_time=start_time)).to_status()
+        name = Path(file.filename or "video").name
+        ext = Path(name).suffix.lower()
+        if ext not in allowed_ext:
+            raise HTTPException(
+                415, f"Unsupported file type '{ext or 'unknown'}'. Allowed: {', '.join(sorted(allowed_ext))}"
+            )
+        # one folder per upload, so the original file name is kept for display
+        folder = Path(cfg.paths.uploads) / uuid.uuid4().hex[:8]
+        folder.mkdir(parents=True, exist_ok=True)
+        dest = folder / re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+        size = 0
+        try:
+            with open(dest, "wb") as out:
+                while chunk := file.file.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise HTTPException(413, f"File is larger than {upload_cfg.max_mb} MB")
+                    out.write(chunk)
+        except HTTPException:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise
+        except Exception:  # noqa: BLE001
+            shutil.rmtree(folder, ignore_errors=True)
+            log.exception("Saving upload failed")
+            raise HTTPException(500, "Could not save the uploaded file")
+        if size == 0:
+            shutil.rmtree(folder, ignore_errors=True)
+            raise HTTPException(400, "The uploaded file is empty")
+        req = IngestRequest(source=str(dest), camera_id=camera_id.strip() or "cam-01", start_time=start_time)
+        return submit(req).to_status()
 
     @app.get("/jobs", response_model=List[JobStatus])
     def list_jobs():

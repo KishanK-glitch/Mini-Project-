@@ -213,17 +213,37 @@ def _region_color(region: np.ndarray) -> Optional[str]:
     return names[int(np.bincount(idx, minlength=len(names)).argmax())]
 
 
-def color_names(crop_bgr: np.ndarray, class_name: str) -> Tuple[Optional[str], Optional[str]]:
-    """(upper, lower) colours for a person; (body, None) for anything else.
-
-    For non-person classes the body colour is stored in the `upper_color` field.
-    """
+def _regions(crop_bgr: np.ndarray, class_name: str):
+    """(upper, lower) regions of a person crop; (body, None) for anything else."""
     h, w = crop_bgr.shape[:2]
     cx1, cx2 = int(w * 0.2), max(int(w * 0.8), int(w * 0.2) + 1)
     if class_name == "person":
         upper = crop_bgr[int(h * 0.18): max(int(h * 0.50), int(h * 0.18) + 1), cx1:cx2]
         lower = crop_bgr[int(h * 0.55): max(int(h * 0.92), int(h * 0.55) + 1), cx1:cx2]
-        return _region_color(upper), _region_color(lower)
+        return upper, lower
     bx1, bx2 = int(w * 0.15), max(int(w * 0.85), int(w * 0.15) + 1)
-    body = crop_bgr[int(h * 0.30): max(int(h * 0.85), int(h * 0.30) + 1), bx1:bx2]
-    return _region_color(body), None
+    return crop_bgr[int(h * 0.30): max(int(h * 0.85), int(h * 0.30) + 1), bx1:bx2], None
+
+
+def color_names(crop_bgr: np.ndarray, class_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """(upper, lower) colours for a person; (body, None) for anything else.
+
+    For non-person classes the body colour is stored in the `upper_color` field.
+    """
+    upper, lower = _regions(crop_bgr, class_name)
+    return _region_color(upper), (_region_color(lower) if lower is not None else None)
+
+
+def _region_tone(region: Optional[np.ndarray]) -> Optional[str]:
+    """dark / mid / light from median brightness. Works on colourless footage."""
+    if region is None or region.size == 0:
+        return None
+    gray = cv2.cvtColor(cv2.resize(region, (24, 24), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    m = float(np.median(gray))
+    return "dark" if m < 80 else ("light" if m >= 160 else "mid")
+
+
+def tone_names(crop_bgr: np.ndarray, class_name: str) -> Tuple[Optional[str], Optional[str]]:
+    """(upper, lower) brightness tone; (body, None) for non-person classes."""
+    upper, lower = _regions(crop_bgr, class_name)
+    return _region_tone(upper), (_region_tone(lower) if lower is not None else None)

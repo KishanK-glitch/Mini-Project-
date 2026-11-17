@@ -10,10 +10,23 @@ app:
 ingestion:
   frame_stride: 5               # process every Nth frame (30 fps video -> ~6 fps)
   max_side: 960                 # downscale frames so the longest side <= this (0 = off)
+
+  # --- any video format: convert to a standard H.264 MP4 before indexing ---
+  normalize: auto               # auto = only if OpenCV can't read the file | always | never
+  normalize_max_side: 1280      # downscale while converting, faster (0 = keep size)
+
+  # --- night / infrared (colourless) footage ---
+  night_detect: true            # decide per frame whether colour is usable
+  night_sat_threshold: 18       # mean saturation (0-255) below this ...
+  night_colour_fraction: 0.03   # ... AND fewer than this fraction of colourful pixels = colourless
+  enhance_low_light: auto       # auto (colourless or dark frames) | always | never
+  night_confidence: 0.25        # YOLO confidence used on colourless frames (detects more)
+
   # --- motion skipping: don't run YOLO on frames where nothing changed ---
   motion_skip: true
   motion_min_area: 0.002        # fraction of pixels that must change to count as motion
   force_detect_every_sec: 2.0   # still detect at least this often (static people/cars)
+
   # --- one embedding per track (average of the sharpest crops) ---
   crops_per_track: 5            # best-quality crops averaged into one vector
   track_timeout_sec: 3.0        # track is finished when unseen for this long
@@ -32,12 +45,12 @@ detection:
   confidence: 0.35
   iou: 0.5
   imgsz: 640
-  device: xpu                 # auto | cpu | cuda | intel:gpu | intel:npu | intel:cpu
+  device: auto                  # auto | cpu | cuda | xpu (Intel GPU via OpenVINO)
   classes: [person, bicycle, car, motorcycle, bus, truck, backpack, handbag, suitcase]
 
 tracking:
   backend: bytetrack            # bytetrack | iou (simple fallback)
-  activation_threshold: 0.35
+  activation_threshold: 0.25    # <= night_confidence so tracks can start on night footage
   lost_track_buffer: 30         # frames (at the *processed* frame rate)
   matching_threshold: 0.8
   min_consecutive_frames: 1
@@ -78,10 +91,17 @@ retrieval:
     - a street
     - an empty scene
     - a blurry photo
-  # strict: a colour word in the query must match the colour measured from the pixels (HSV)
+  # strict: a colour word in the query must match the colour measured from the pixels (HSV).
+  # Night/infrared footage has no usable colour, so colour words are ignored there (and
+  # dark/light tone is used instead).
   color_mode: strict            # strict | off
 
 api:
   host: 0.0.0.0
   port: 8000
   cors_origins: ["*"]
+  upload:
+    max_mb: 4096
+    allowed_extensions: [".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv",
+                         ".mpg", ".mpeg", ".ts", ".mts", ".m2ts", ".3gp", ".ogv", ".asf",
+                         ".vob", ".mxf", ".dav", ".264", ".h264", ".265", ".h265"]

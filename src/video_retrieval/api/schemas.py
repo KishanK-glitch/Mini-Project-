@@ -53,6 +53,9 @@ class SearchHit(BaseModel):
     num_matches: int
     upper_color: Optional[str] = None
     lower_color: Optional[str] = None
+    upper_tone: Optional[str] = None
+    lower_tone: Optional[str] = None
+    is_night: bool = False  # colourless night / infrared footage
     thumbnail_url: Optional[str] = None
     clip_url: Optional[str] = None
 
@@ -62,6 +65,7 @@ class SearchResponse(BaseModel):
     took_ms: float
     count: int
     results: List[SearchHit]
+    notes: List[str] = []  # e.g. "colour ignored for night footage"
 
 
 class VideoInfo(BaseModel):

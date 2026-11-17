@@ -1,6 +1,7 @@
 # Core
 numpy>=1.24
 opencv-python>=4.8
+imageio-ffmpeg>=0.5.1   # bundled ffmpeg: converts any video format + cuts playable clips
 Pillow>=10.0
 PyYAML>=6.0
 python-dotenv>=1.0

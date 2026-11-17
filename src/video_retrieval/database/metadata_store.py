@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, create_engine, select
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, create_engine, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 
@@ -63,6 +63,11 @@ class Observation(Base):
     # colours measured from pixels (HSV); upper = shirt/jacket, lower = trousers, body = vehicles
     upper_color: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
     lower_color: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    # dark / mid / light, measured from brightness (works on colourless night footage too)
+    upper_tone: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    lower_tone: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    # True when the frames were colourless (night / infrared): colours are not stored then
+    is_night: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 def _as_dict(obj: Base) -> Dict[str, Any]:

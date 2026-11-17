@@ -17,6 +17,7 @@ import numpy as np
 
 from video_retrieval.database.metadata_store import MetadataStore
 from video_retrieval.database.vector_store import VectorStore
+from video_retrieval.pipeline.ingestion import find_ffmpeg as _find_ffmpeg
 from video_retrieval.utils.logging import get_logger
 
 log = get_logger(__name__)
@@ -107,6 +108,64 @@ def colour_ok(o: Dict[str, Any], constraints: List[tuple]) -> bool:
     return True
 
 
+_TONE_WORDS = {"dark": "dark", "light": "light", "bright": "light", "pale": "light"}
+
+
+def _region_after(toks: List[str], i: int) -> str:
+    for nxt in toks[i + 1: i + 3]:
+        if nxt in _UPPER:
+            return "upper"
+        if nxt in _LOWER:
+            return "lower"
+        if nxt in _BODY:
+            return "body"
+    return "any"
+
+
+def parse_tone_constraints(query: str) -> List[tuple]:
+    """"dark jacket and light trousers" -> [("upper","dark"), ("lower","light")]."""
+    toks = [t.strip(".,!?") for t in query.lower().replace("t-shirt", "tshirt").replace(",", " ").split()]
+    out = []
+    for i, tok in enumerate(toks):
+        if tok in _TONE_WORDS:
+            region = _region_after(toks, i)
+            if region != "any":
+                out.append((region, _TONE_WORDS[tok]))
+    return out
+
+
+_NIGHT_TONE = {"black": "dark", "white": "light"}
+
+
+def derive_night_tones(colour_constraints: List[tuple]) -> List[tuple]:
+    """On colourless footage only black/white survive as a brightness hint."""
+    return [(region, _NIGHT_TONE[col]) for region, col in colour_constraints
+            if col in _NIGHT_TONE and region in ("upper", "lower", "body")]
+
+
+def tone_ok(o: Dict[str, Any], constraints: List[tuple]) -> bool:
+    """Brightness match. Tolerant: 'mid' fits both dark and light (IR brightness is unreliable)."""
+    for region, want in constraints:
+        if region == "upper":
+            have = o.get("upper_tone")
+        elif region == "lower":
+            have = o.get("lower_tone")
+        else:  # body (vehicles)
+            if o["class_name"] == "person":
+                return False
+            have = o.get("upper_tone")
+        if have is None or (have != want and have != "mid"):
+            return False
+    return True
+
+
+def strip_colours(query: str) -> str:
+    """Remove colour and dark/light words: used for night/IR footage where colour is unusable."""
+    drop = set(COLORS) | set(_COLOR_ALIASES) | set(_TONE_WORDS)
+    kept = [w for w in query.split() if w.lower().strip(".,!?") not in drop]
+    return " ".join(kept) if kept else query
+
+
 def parse_query_classes(query: str) -> set:
     words = set(query.lower().replace(",", " ").split())
     return {cls for cls, kws in CLASS_KEYWORDS.items() if words & kws}
@@ -118,15 +177,22 @@ def fmt_timecode(sec: float) -> str:
 
 
 def extract_clip(video_path: str, start: float, end: float, out_path: Path) -> None:
-    """Cut [start, end] seconds into an MP4. Uses ffmpeg (H.264) if present, else OpenCV."""
+    """Cut [start, end] seconds into an MP4. Uses ffmpeg (H.264) if present, else OpenCV.
+
+    The OpenCV fallback writes MPEG-4 Part 2 ("mp4v"), which browsers cannot play,
+    so install `imageio-ffmpeg` to get browser-playable H.264 clips.
+    """
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = _find_ffmpeg()
     if ffmpeg:
         cmd = [ffmpeg, "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-i", video_path,
                "-t", f"{end - start:.3f}", "-an", "-c:v", "libx264", "-preset", "veryfast",
+               "-pix_fmt", "yuv420p", "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                "-movflags", "+faststart", str(out_path)]
         subprocess.run(cmd, check=True, capture_output=True)
         return
+    log.warning("ffmpeg not found - clip will use mp4v and may not play in browsers "
+                "(pip install imageio-ffmpeg)")
     cap = cv2.VideoCapture(video_path)
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
@@ -155,6 +221,22 @@ class RetrievalPipeline:
         return float(getattr(ms, self.cfg.embedding.backend, 0.0))
 
     # --------------------------------------------------------------- search
+    @staticmethod
+    def _basic_ok(o, v, video_id, camera_id, start_time, end_time, wanted) -> bool:
+        if video_id is not None and v["id"] != video_id:
+            return False
+        if camera_id is not None and v["camera_id"] != camera_id:
+            return False
+        if wanted and (o["kind"] != "object" or o["class_name"] not in wanted):
+            return False
+        if start_time or end_time:
+            if v["start_time"] is None:
+                return False
+            abs_t = v["start_time"] + timedelta(seconds=o["timestamp_sec"])
+            if (start_time and abs_t < start_time) or (end_time and abs_t > end_time):
+                return False
+        return True
+
     def search(
         self,
         query: str,
@@ -169,56 +251,96 @@ class RetrievalPipeline:
         r = self.cfg.retrieval
         top_k = top_k or r.top_k
 
+        colour_on = getattr(r, "color_mode", "off") == "strict"
+        colour_cons = parse_color_constraints(query) if colour_on else []
+        tone_cons = parse_tone_constraints(query) if colour_on else []
+        night_tone_cons = tone_cons + derive_night_tones(colour_cons)
+        has_colour = bool(colour_cons or tone_cons)
+        plain_q = strip_colours(query) if has_colour else query
+
+        # Colourful footage is searched with the full query. Night/IR footage has no usable
+        # colour, so it is searched with the colour words removed.
         qvec = self.encoder.encode_text([query])[0]
-        hits = self.vectors.search(qvec, r.candidate_pool)
-        obs = self.metadata.get_observations([i for i, _ in hits])
+        sources = [(self.vectors.search(qvec, r.candidate_pool), False)]
+        qvec_plain = qvec
+        if has_colour:
+            qvec_plain = self.encoder.encode_text([plain_q])[0]
+            sources.append((self.vectors.search(qvec_plain, r.candidate_pool), True))
+
+        ids = {i for hits, _ in sources for i, _ in hits}
+        obs = self.metadata.get_observations(list(ids))
         videos = self.metadata.get_videos({o["video_id"] for o in obs.values()})
 
         wanted = {c.lower() for c in classes} if classes else None
         parsed = parse_query_classes(query)
-        constraints = (
-            parse_color_constraints(query) if getattr(r, "color_mode", "off") == "strict" else []
-        )
         floor = self._min_score()
-        cands = []
-        for oid, score in hits:
-            o = obs.get(oid)
-            if o is None or score < floor:
-                continue
-            v = videos[o["video_id"]]
-            if video_id is not None and v["id"] != video_id:
-                continue
-            if camera_id is not None and v["camera_id"] != camera_id:
-                continue
-            if wanted and (o["kind"] != "object" or o["class_name"] not in wanted):
-                continue
-            if start_time or end_time:
-                if v["start_time"] is None:
+        groups: Dict[bool, list] = {False: [], True: []}
+        for hits, night_group in sources:
+            for oid, score in hits:
+                o = obs.get(oid)
+                if o is None or score < floor:
                     continue
-                abs_t = v["start_time"] + timedelta(seconds=o["timestamp_sec"])
-                if (start_time and abs_t < start_time) or (end_time and abs_t > end_time):
+                is_night = bool(o.get("is_night"))
+                if has_colour and is_night != night_group:
                     continue
-            if constraints and (o["kind"] != "object" or not colour_ok(o, constraints)):
-                continue  # colour measured from pixels must agree with the query
-            if o["class_name"] in parsed:
-                score += r.class_boost
-            cands.append((score, o, v, None))
+                v = videos[o["video_id"]]
+                if not self._basic_ok(o, v, video_id, camera_id, start_time, end_time, wanted):
+                    continue
+                if has_colour:
+                    if night_group:  # colourless: only brightness hints can be checked
+                        if night_tone_cons and (o["kind"] != "object" or not tone_ok(o, night_tone_cons)):
+                            continue
+                    elif o["kind"] != "object" or not (
+                        colour_ok(o, colour_cons) and tone_ok(o, tone_cons)
+                    ):
+                        continue  # colour measured from pixels must agree with the query
+                if o["class_name"] in parsed:
+                    score += r.class_boost
+                groups[night_group].append((score, o, v, None))
 
-        if getattr(r, "calibrate", False) and cands:
-            cands = self._calibrate(query, qvec, cands)
+        cands: list = []
+        for night_group, items in groups.items():
+            if not items:
+                continue
+            q_text, q_vec = (plain_q, qvec_plain) if night_group else (query, qvec)
+            if getattr(r, "calibrate", False):
+                items = self._calibrate(q_text, q_vec, items)
+            cands += items
 
         segments = self._segments(cands, r.segment_gap_sec) if cands else []
-        segments.sort(key=lambda seg: seg["score"], reverse=True)
         margin = getattr(r, "relative_margin", 0)
-        if segments and margin:
-            cutoff = segments[0]["score"] * (1 - margin)
-            segments = [x for x in segments if x["score"] >= cutoff]
+
+        def trim(segs: list) -> list:
+            segs = sorted(segs, key=lambda seg: seg["score"], reverse=True)
+            if segs and margin:
+                cutoff = segs[0]["score"] * (1 - margin)
+                segs = [x for x in segs if x["score"] >= cutoff]
+            return segs
+
+        if has_colour:
+            # Scores from the full query (colour verified) and the colour-stripped query
+            # (night/IR) are on different scales, so trim each group on its own and list the
+            # colour-verified results first.
+            day_segs = [x for x in segments if not x["best"].get("is_night")]
+            night_segs = [x for x in segments if x["best"].get("is_night")]
+            segments = trim(day_segs) + trim(night_segs)
+        else:
+            segments = trim(segments)
         results = [self._format(rank, seg) for rank, seg in enumerate(segments[:top_k], 1)]
+
+        notes: List[str] = []
+        n_night = sum(1 for x in results if x["is_night"])
+        if has_colour and n_night:
+            notes.append(
+                f"Colour was ignored for {n_night} night/infrared result(s) - they were matched "
+                "on shape, clothing type and brightness instead."
+            )
         return {
             "query": query,
             "took_ms": round((time.perf_counter() - t0) * 1000, 2),
             "count": len(results),
             "results": results,
+            "notes": notes,
         }
 
     def _contrast_embeddings(self, query: str) -> np.ndarray:
@@ -327,6 +449,9 @@ class RetrievalPipeline:
             "num_matches": seg["n"],
             "upper_color": o.get("upper_color"),
             "lower_color": o.get("lower_color"),
+            "upper_tone": o.get("upper_tone"),
+            "lower_tone": o.get("lower_tone"),
+            "is_night": bool(o.get("is_night")),
             "thumbnail_url": f"/thumbnails/{o['thumbnail']}" if o["thumbnail"] else None,
             "clip_url": f"/clips/{v['id']}?start={start:.2f}&end={end:.2f}" if is_file else None,
         }

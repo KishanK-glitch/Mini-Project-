@@ -21,13 +21,19 @@ class Detection:
     class_name: str
 
 
-def _intel_device() -> str:
-    """Best OpenVINO device: Arc GPU if present, else CPU."""
+def _intel_devices(device: str) -> List[str]:
+    """OpenVINO device names to try, best first.
+
+    Newer ultralytics spells the Intel GPU 'xpu' ('intel:gpu' is deprecated and warns on
+    every frame), so try that first and keep the old names as fallbacks.
+    """
+    if device not in (None, "", "auto"):
+        return [device]
     from openvino import Core
 
     devices = Core().available_devices  # e.g. ['CPU', 'GPU', 'NPU']
     log.info("OpenVINO devices: %s", devices)
-    return "intel:gpu" if any(d.startswith("GPU") for d in devices) else "intel:cpu"
+    return ["xpu", "intel:gpu", "intel:cpu"] if any(d.startswith("GPU") for d in devices) else ["intel:cpu"]
 
 
 class YoloDetector:
@@ -49,12 +55,12 @@ class YoloDetector:
         self.runtime = "torch"
         self.model = None
         self.device = None
+        self._ov_devices: List[str] = []
 
         wants_torch_device = str(device).startswith(("cuda", "mps"))
         if runtime in ("auto", "openvino") and not wants_torch_device:
             try:
-                self.model, self.device = self._load_openvino(model, device)
-                self.runtime = "openvino"
+                self._load_openvino(model, device)
             except Exception as exc:  # noqa: BLE001
                 log.warning("OpenVINO unavailable (%s) - using PyTorch instead", exc)
         if self.model is None:
@@ -73,24 +79,27 @@ class YoloDetector:
     # ---------------------------------------------------------------- loading
     def _load_torch(self, device: str) -> None:
         self.model = self._YOLO(self._model_name)
-        self.device = None if device in (None, "", "auto") or str(device).startswith("intel") else device
+        torch_ok = device not in (None, "", "auto") and not str(device).startswith("intel")
+        self.device = device if torch_ok else None
         self.runtime = "torch"
 
-    def _load_openvino(self, model: str, device: str):
-        dev = _intel_device() if device in (None, "", "auto") else device
+    def _load_openvino(self, model: str, device: str) -> None:
+        self._ov_devices = _intel_devices(device)
         ov_dir = Path(model).with_name(f"{Path(model).stem}_openvino_model")
         if not ov_dir.exists():
             log.info("Exporting %s to OpenVINO (one-time, may take a minute)...", model)
             base = self._YOLO(model)
             exported = base.export(format="openvino", imgsz=self.imgsz, half=False)
             ov_dir = Path(str(exported))
-        return self._YOLO(str(ov_dir), task="detect"), dev
+        self.model = self._YOLO(str(ov_dir), task="detect")
+        self.device = self._ov_devices[0]
+        self.runtime = "openvino"
 
     # -------------------------------------------------------------- inference
-    def _predict(self, frame_bgr: np.ndarray):
+    def _predict(self, frame_bgr: np.ndarray, conf: Optional[float]):
         return self.model.predict(
             frame_bgr,
-            conf=self.confidence,
+            conf=self.confidence if conf is None else conf,
             iou=self.iou,
             imgsz=self.imgsz,
             classes=self.class_ids,
@@ -98,25 +107,32 @@ class YoloDetector:
             verbose=False,
         )[0]
 
-    def detect(self, frame_bgr: np.ndarray) -> List[Detection]:
-        try:
-            result = self._predict(frame_bgr)
-        except Exception as exc:  # noqa: BLE001
-            if self.runtime != "openvino":
-                raise
-            log.warning("OpenVINO inference failed (%s) - switching to PyTorch", exc)
-            self._load_torch("auto")
-            result = self._predict(frame_bgr)
+    def detect(self, frame_bgr: np.ndarray, conf: Optional[float] = None) -> List[Detection]:
+        """`conf` overrides the confidence threshold for this frame (used on night footage)."""
+        while True:
+            try:
+                result = self._predict(frame_bgr, conf)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if self.runtime != "openvino":
+                    raise
+                if len(self._ov_devices) > 1:  # try the next OpenVINO device name
+                    failed = self._ov_devices.pop(0)
+                    self.device = self._ov_devices[0]
+                    log.warning("OpenVINO device %r failed (%s) - trying %r", failed, exc, self.device)
+                    continue
+                log.warning("OpenVINO inference failed (%s) - switching to PyTorch", exc)
+                self._load_torch("auto")
 
         boxes = result.boxes
         if boxes is None or len(boxes) == 0:
             return []
         xyxy = boxes.xyxy.cpu().numpy()
-        conf = boxes.conf.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
         cls = boxes.cls.cpu().numpy().astype(int)
         return [
             Detection(tuple(map(float, b)), float(c), int(k), self.names[int(k)])
-            for b, c, k in zip(xyxy, conf, cls)
+            for b, c, k in zip(xyxy, confs, cls)
         ]
 
 

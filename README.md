@@ -131,6 +131,12 @@ quality (mAP, MOTA/IDF1) is best measured with the standard toolkits on your ann
 - **Rejection of non-matches:** every hit is re-scored against contrast prompts (generic ones from `retrieval.negative_prompts` plus the query with its colour words swapped). Hits under `retrieval.min_confidence` are dropped, so a query with no match returns an empty list. Tune it by comparing the `conf` shown on the cards for a query that is present and one that is absent.
 - **Motion skipping:** frames with no change since the last detection skip YOLO (still detects at least every 2 s).
 
+## Upload, formats and night footage
+
+- **Upload button:** the web page has an upload card (file, camera name, optional start time). It shows upload progress, then "converting", then "indexing" progress, and the video is searchable when it finishes. Pick a camera and/or a single video in the search box to narrow the search.
+- **Any video format:** files OpenCV can't read (HEVC, WMV, FLV, MKV variants, TS, MPG ...) are converted to a standard H.264 MP4 with ffmpeg (bundled via `imageio-ffmpeg`) before indexing; the original file name is kept. Set `ingestion.normalize: always` to convert every upload (constant frame rate) or `never` to skip it. Allowed extensions and the size limit are in `api.upload`. Vendor-proprietary DVR formats (e.g. Dahua `.dav`) may need the vendor's player to export first.
+- **Night / infrared footage:** each frame is checked for usable colour (`ingestion.night_*`). Colourless frames are contrast-enhanced, detected with a lower confidence, and stored without colours (only a dark / mid / light brightness tone). When you search with colour words, colour-verified daytime matches are listed first; night results are matched on the query *without* the colour words (plus any dark/light hint) and are labelled "Night / IR" with a note.
+
 ## Intel CPU / Arc GPU
 
 - **YOLO:** runs through OpenVINO automatically (`detection.runtime: auto`) on the Arc GPU if present, else the CPU. The first run exports `yolo11s` to OpenVINO once. If OpenVINO fails, it falls back to PyTorch.
@@ -150,5 +156,6 @@ quality (mAP, MOTA/IDF1) is best measured with the standard toolkits on your ann
 - SigLIP/CLIP match *appearance* (colours, clothing, object types) well but does not understand motion or
   temporal events ("running", "loitering"); this is the gap noted in the literature review. Future work:
   VideoCLIP-style clip embeddings or captioning (Cap4Video) and LLM query refinement.
+- Infrared reflectance differs from visible colour, so brightness tone on night footage is only a rough hint; night accuracy is lower than daytime.
 - Spatial phrases ("near the main gate") are only matched through full-frame embeddings, not geometry.
 - ByteTrack comes from `supervision<0.30`; with a newer version the app falls back to a simpler IoU tracker.
